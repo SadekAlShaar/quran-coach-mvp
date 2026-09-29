@@ -1,0 +1,14 @@
+{
+  "name": "مدرّب التلاوة",
+  "short_name": "تلاوتي",
+  "description": "تدريب على قراءة وحفظ القرآن مع ملاحظات آلية على التلاوة.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f4ed",
+  "theme_color": "#12372a",
+  "lang": "ar",
+  "dir": "rtl",
+  "icons": [
+    {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+  ]
+}
