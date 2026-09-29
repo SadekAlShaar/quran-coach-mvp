@@ -29,8 +29,10 @@ export default function Practice() {
   const mediaRecorder = useRef<MediaRecorder | null>(null);
   const chunks = useRef<Blob[]>([]);
   const wordAudio = useRef<HTMLAudioElement | null>(null);
+  const ayahAudio = useRef<HTMLAudioElement | null>(null);
   const [playingWordPosition, setPlayingWordPosition] = useState<number | null>(null);
   const [playingAllMistakes, setPlayingAllMistakes] = useState(false);
+  const [playingAyah, setPlayingAyah] = useState(false);
 
   const surah = useMemo(() => surahs.find((s) => s.number === surahNo) ?? surahs[0], [surahNo]);
   const ayah = useMemo(() => surah.ayahs.find((a) => a.number === ayahNo) ?? surah.ayahs[0], [surah, ayahNo]);
@@ -57,6 +59,40 @@ export default function Practice() {
     return `https://audio.qurancdn.com/wbw/${chapter}_${verse}_${word}.mp3`;
   }
 
+  function quranAyahAudioUrl() {
+    // Quran Foundation returns Alafasy verse audio paths in this format.
+    // Using the public media CDN means Mom/Dad can listen without another API key.
+    const chapter = String(surah.number).padStart(3, "0");
+    const verse = String(ayah.number).padStart(3, "0");
+    return `https://verses.quran.com/Alafasy/mp3/${chapter}${verse}.mp3`;
+  }
+
+  function stopAyahAudio() {
+    if (ayahAudio.current) {
+      ayahAudio.current.pause();
+      ayahAudio.current.currentTime = 0;
+      ayahAudio.current = null;
+    }
+    setPlayingAyah(false);
+  }
+
+  async function playAyahWithTajweed(): Promise<void> {
+    stopWordAudio();
+    stopAyahAudio();
+    setPlayingAyah(true);
+    const player = new Audio(quranAyahAudioUrl());
+    ayahAudio.current = player;
+
+    await new Promise<void>((resolve, reject) => {
+      player.onended = () => resolve();
+      player.onerror = () => reject(new Error("Could not load Quran ayah audio"));
+      player.play().catch(reject);
+    }).finally(() => {
+      if (ayahAudio.current === player) ayahAudio.current = null;
+      setPlayingAyah(false);
+    });
+  }
+
   function stopWordAudio() {
     if (wordAudio.current) {
       wordAudio.current.pause();
@@ -67,6 +103,7 @@ export default function Practice() {
   }
 
   async function playWord(position: number): Promise<void> {
+    stopAyahAudio();
     stopWordAudio();
     setPlayingWordPosition(position);
     const player = new Audio(quranWordAudioUrl(position));
@@ -120,6 +157,7 @@ export default function Practice() {
 
   function chooseSurah(nextSurahNo: number) {
     stopWordAudio();
+    stopAyahAudio();
     setSurahNo(nextSurahNo);
     setAyahNo(1);
     setAnalysis(null);
@@ -216,7 +254,7 @@ export default function Practice() {
           </select>
 
           <div className="label" style={{ marginTop: 12 }}>اختر الآية</div>
-          <select value={ayahNo} onChange={(e) => { stopWordAudio(); setAyahNo(Number(e.target.value)); setAnalysis(null); setAudioUrl(null); }}>
+          <select value={ayahNo} onChange={(e) => { stopWordAudio(); stopAyahAudio(); setAyahNo(Number(e.target.value)); setAnalysis(null); setAudioUrl(null); }}>
             {surah.ayahs.map((a) => <option value={a.number} key={a.number}>الآية {a.number}</option>)}
           </select>
         </section>
@@ -225,6 +263,18 @@ export default function Practice() {
       <section className="card" style={{marginTop: 14}}>
         <div className="label">سورة {surah.name} — الآية {ayah.number}</div>
         <div className="ayahText">{ayah.text}</div>
+        <div className="controls">
+          <button
+            type="button"
+            className="tajweedListen"
+            onClick={() => playAyahWithTajweed().catch((error) => {
+              console.error(error);
+              setStatus("ما قدرت شغّل تلاوة الآية. جرّب مرة ثانية وتأكد من اتصال الإنترنت.");
+            })}
+          >
+            {playingAyah ? "🕌 عم يقرأ الآية…" : "🕌 اسمع الآية بتجويد"}
+          </button>
+        </div>
         <div className="controls">
           {!recording ? (
             <button className="primary" onClick={startRecording} disabled={busy}>🎙️ ابدأ القراءة</button>
@@ -249,18 +299,32 @@ export default function Practice() {
                     {w.expected}
                   </span>
                   {(w.status === "wrong" || w.status === "missing") && w.quranPosition !== null && (
-                    <button
-                      type="button"
-                      className="wordListen"
-                      onClick={() => playWord(w.quranPosition!).catch((error) => {
-                        console.error(error);
-                        setStatus("ما قدرت شغّل نطق الكلمة. جرّب مرة ثانية وتأكد من اتصال الإنترنت.");
-                      })}
-                      disabled={playingAllMistakes}
-                      aria-label={`اسمع النطق الصحيح لكلمة ${w.expected}`}
-                    >
-                      {playingWordPosition === w.quranPosition ? "🔊 عم يقرأ…" : "🔊 اسمع"}
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        className="wordListen"
+                        onClick={() => playWord(w.quranPosition!).catch((error) => {
+                          console.error(error);
+                          setStatus("ما قدرت شغّل نطق الكلمة. جرّب مرة ثانية وتأكد من اتصال الإنترنت.");
+                        })}
+                        disabled={playingAllMistakes || playingAyah}
+                        aria-label={`اسمع النطق الصحيح لكلمة ${w.expected}`}
+                      >
+                        {playingWordPosition === w.quranPosition ? "🔊 عم يقرأ…" : "🔊 اسمع الكلمة"}
+                      </button>
+                      <button
+                        type="button"
+                        className="wordListen contextual"
+                        onClick={() => playAyahWithTajweed().catch((error) => {
+                          console.error(error);
+                          setStatus("ما قدرت شغّل تلاوة الآية. جرّب مرة ثانية وتأكد من اتصال الإنترنت.");
+                        })}
+                        disabled={playingAllMistakes || playingAyah}
+                        aria-label={`اسمع كلمة ${w.expected} ضمن تلاوة الآية`}
+                      >
+                        🕌 اسمعها ضمن الآية
+                      </button>
+                    </>
                   )}
                 </div>
               ))}

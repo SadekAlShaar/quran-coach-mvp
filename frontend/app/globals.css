@@ -51,3 +51,8 @@ select { width:100%; border:1px solid var(--border); border-radius:14px; backgro
 .wordListen { border:1px solid #d8d2c5; background:#fffdf7; color:var(--green); border-radius:999px; padding:5px 9px; cursor:pointer; font-size:12px; font-weight:700; }
 .wordListen:hover { background:#edf4f0; }
 .wordListen:disabled { opacity:.55; cursor:not-allowed; }
+
+.tajweedListen { border:1px solid #d8d2c5; background:#fff7df; color:var(--green); border-radius:16px; padding:12px 16px; cursor:pointer; font-weight:800; }
+.tajweedListen:hover { background:#fff0c4; }
+.tajweedListen:disabled { opacity:.55; cursor:not-allowed; }
+.wordListen.contextual { background:#f7f1df; }
