@@ -28,9 +28,81 @@ export default function Practice() {
   const [installPrompt, setInstallPrompt] = useState<any>(null);
   const mediaRecorder = useRef<MediaRecorder | null>(null);
   const chunks = useRef<Blob[]>([]);
+  const wordAudio = useRef<HTMLAudioElement | null>(null);
+  const [playingWordPosition, setPlayingWordPosition] = useState<number | null>(null);
+  const [playingAllMistakes, setPlayingAllMistakes] = useState(false);
 
   const surah = useMemo(() => surahs.find((s) => s.number === surahNo) ?? surahs[0], [surahNo]);
   const ayah = useMemo(() => surah.ayahs.find((a) => a.number === ayahNo) ?? surah.ayahs[0], [surah, ayahNo]);
+
+  const wordsWithPositions = useMemo(() => {
+    if (!analysis) return [];
+    let quranPosition = 0;
+    return analysis.words.map((word, resultIndex) => {
+      // An "extra" word was spoken by the learner and does not consume a Quran word position.
+      // Every other status corresponds to the next expected word in the ayah.
+      if (word.status !== "extra") quranPosition += 1;
+      return {
+        ...word,
+        resultIndex,
+        quranPosition: word.status === "extra" ? null : quranPosition,
+      };
+    });
+  }, [analysis]);
+
+  function quranWordAudioUrl(position: number) {
+    const chapter = String(surah.number).padStart(3, "0");
+    const verse = String(ayah.number).padStart(3, "0");
+    const word = String(position).padStart(3, "0");
+    return `https://audio.qurancdn.com/wbw/${chapter}_${verse}_${word}.mp3`;
+  }
+
+  function stopWordAudio() {
+    if (wordAudio.current) {
+      wordAudio.current.pause();
+      wordAudio.current.currentTime = 0;
+      wordAudio.current = null;
+    }
+    setPlayingWordPosition(null);
+  }
+
+  async function playWord(position: number): Promise<void> {
+    stopWordAudio();
+    setPlayingWordPosition(position);
+    const player = new Audio(quranWordAudioUrl(position));
+    wordAudio.current = player;
+
+    await new Promise<void>((resolve, reject) => {
+      player.onended = () => resolve();
+      player.onerror = () => reject(new Error("Could not load Quran word audio"));
+      player.play().catch(reject);
+    }).finally(() => {
+      if (wordAudio.current === player) wordAudio.current = null;
+      setPlayingWordPosition((current) => current === position ? null : current);
+    });
+  }
+
+  async function hearAllMistakes() {
+    const mistakes = wordsWithPositions.filter(
+      (word) => (word.status === "wrong" || word.status === "missing") && word.quranPosition !== null
+    );
+    if (!mistakes.length) return;
+
+    setPlayingAllMistakes(true);
+    try {
+      for (const word of mistakes) {
+        if (word.quranPosition !== null) {
+          await playWord(word.quranPosition);
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+      }
+    } catch (error) {
+      console.error(error);
+      setStatus("ما قدرت شغّل نطق الكلمة. جرّب مرة ثانية وتأكد من اتصال الإنترنت.");
+    } finally {
+      setPlayingAllMistakes(false);
+    }
+  }
 
   useEffect(() => {
     const saved = localStorage.getItem("quran-coach-profile");
@@ -47,6 +119,7 @@ export default function Practice() {
   }
 
   function chooseSurah(nextSurahNo: number) {
+    stopWordAudio();
     setSurahNo(nextSurahNo);
     setAyahNo(1);
     setAnalysis(null);
@@ -143,7 +216,7 @@ export default function Practice() {
           </select>
 
           <div className="label" style={{ marginTop: 12 }}>اختر الآية</div>
-          <select value={ayahNo} onChange={(e) => { setAyahNo(Number(e.target.value)); setAnalysis(null); setAudioUrl(null); }}>
+          <select value={ayahNo} onChange={(e) => { stopWordAudio(); setAyahNo(Number(e.target.value)); setAnalysis(null); setAudioUrl(null); }}>
             {surah.ayahs.map((a) => <option value={a.number} key={a.number}>الآية {a.number}</option>)}
           </select>
         </section>
@@ -167,8 +240,43 @@ export default function Practice() {
             <div className="score">النتيجة: {analysis.score}%</div>
             <div className="small">ما سمعه النظام: {analysis.transcript || "—"}</div>
             <div className="words">
-              {analysis.words.map((w, i) => <span key={`${w.expected}-${i}`} className={`word ${w.status}`} title={w.heard ? `سمع: ${w.heard}` : undefined}>{w.expected}</span>)}
+              {wordsWithPositions.map((w) => (
+                <div className="wordResult" key={`${w.expected}-${w.resultIndex}`}>
+                  <span
+                    className={`word ${w.status}`}
+                    title={w.heard ? `سمع: ${w.heard}` : undefined}
+                  >
+                    {w.expected}
+                  </span>
+                  {(w.status === "wrong" || w.status === "missing") && w.quranPosition !== null && (
+                    <button
+                      type="button"
+                      className="wordListen"
+                      onClick={() => playWord(w.quranPosition!).catch((error) => {
+                        console.error(error);
+                        setStatus("ما قدرت شغّل نطق الكلمة. جرّب مرة ثانية وتأكد من اتصال الإنترنت.");
+                      })}
+                      disabled={playingAllMistakes}
+                      aria-label={`اسمع النطق الصحيح لكلمة ${w.expected}`}
+                    >
+                      {playingWordPosition === w.quranPosition ? "🔊 عم يقرأ…" : "🔊 اسمع"}
+                    </button>
+                  )}
+                </div>
+              ))}
             </div>
+            {wordsWithPositions.some((w) => w.status === "wrong" || w.status === "missing") && (
+              <div className="controls">
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={hearAllMistakes}
+                  disabled={playingAllMistakes}
+                >
+                  {playingAllMistakes ? "🔊 عم يقرأ الكلمات…" : "🔊 اسمع كل الكلمات التي تحتاج إعادة"}
+                </button>
+              </div>
+            )}
             {analysis.warning && <div className="status error">{analysis.warning}</div>}
           </div>
         )}
