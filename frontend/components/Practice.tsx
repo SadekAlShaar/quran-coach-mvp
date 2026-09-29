@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { fatiha } from "@/lib/fatiha";
+import { surahs } from "@/lib/surahs";
 
 type WordResult = { expected: string; heard?: string | null; status: "correct" | "wrong" | "missing" | "extra" };
 type Analysis = {
@@ -18,6 +18,7 @@ const PROFILES = ["أبي", "أمي", "أنا"];
 
 export default function Practice() {
   const [profile, setProfile] = useState("أنا");
+  const [surahNo, setSurahNo] = useState(1);
   const [ayahNo, setAyahNo] = useState(1);
   const [recording, setRecording] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -27,7 +28,9 @@ export default function Practice() {
   const [installPrompt, setInstallPrompt] = useState<any>(null);
   const mediaRecorder = useRef<MediaRecorder | null>(null);
   const chunks = useRef<Blob[]>([]);
-  const ayah = useMemo(() => fatiha.find((a) => a.number === ayahNo)!, [ayahNo]);
+
+  const surah = useMemo(() => surahs.find((s) => s.number === surahNo) ?? surahs[0], [surahNo]);
+  const ayah = useMemo(() => surah.ayahs.find((a) => a.number === ayahNo) ?? surah.ayahs[0], [surah, ayahNo]);
 
   useEffect(() => {
     const saved = localStorage.getItem("quran-coach-profile");
@@ -41,6 +44,14 @@ export default function Practice() {
   function chooseProfile(name: string) {
     setProfile(name);
     localStorage.setItem("quran-coach-profile", name);
+  }
+
+  function chooseSurah(nextSurahNo: number) {
+    setSurahNo(nextSurahNo);
+    setAyahNo(1);
+    setAnalysis(null);
+    setAudioUrl(null);
+    setStatus("اضغط على الميكروفون واقرأ الآية كاملة.");
   }
 
   async function installApp() {
@@ -87,17 +98,22 @@ export default function Practice() {
       const data = new FormData();
       const extension = mimeType.includes("mp4") ? "m4a" : mimeType.includes("ogg") ? "ogg" : "webm";
       data.append("audio", blob, `recitation.${extension}`);
-      data.append("surah", "1");
+      data.append("surah", String(surah.number));
       data.append("ayah", String(ayah.number));
       data.append("expected_text", ayah.simpleText);
       data.append("profile", profile);
+
       const res = await fetch(`${API}/analyze`, { method: "POST", body: data });
       if (!res.ok) throw new Error(await res.text());
       const json = await res.json();
       setAnalysis(json);
       setStatus(json.feedback);
-      localStorage.setItem(`progress-${profile}-1-${ayah.number}`, JSON.stringify({ score: json.score, at: new Date().toISOString() }));
+      localStorage.setItem(
+        `progress-${profile}-${surah.number}-${ayah.number}`,
+        JSON.stringify({ score: json.score, at: new Date().toISOString() })
+      );
     } catch (e) {
+      console.error(e);
       setStatus("صار خطأ أثناء التحليل. تأكد أن الـBackend شغّال وأن عنوان الـAPI صحيح.");
     } finally {
       setBusy(false);
@@ -119,16 +135,22 @@ export default function Practice() {
             {PROFILES.map((p) => <button key={p} className={`chip ${profile === p ? "active" : ""}`} onClick={() => chooseProfile(p)}>{p}</button>)}
           </div>
         </section>
+
         <section className="card">
-          <div className="label">سورة الفاتحة — اختر الآية</div>
-          <select value={ayahNo} onChange={(e) => { setAyahNo(Number(e.target.value)); setAnalysis(null); }}>
-            {fatiha.map((a) => <option value={a.number} key={a.number}>الآية {a.number}</option>)}
+          <div className="label">اختر السورة</div>
+          <select value={surahNo} onChange={(e) => chooseSurah(Number(e.target.value))}>
+            {surahs.map((s) => <option value={s.number} key={s.number}>سورة {s.name}</option>)}
+          </select>
+
+          <div className="label" style={{ marginTop: 12 }}>اختر الآية</div>
+          <select value={ayahNo} onChange={(e) => { setAyahNo(Number(e.target.value)); setAnalysis(null); setAudioUrl(null); }}>
+            {surah.ayahs.map((a) => <option value={a.number} key={a.number}>الآية {a.number}</option>)}
           </select>
         </section>
       </div>
 
       <section className="card" style={{marginTop: 14}}>
-        <div className="label">اقرأ الآية {ayah.number}</div>
+        <div className="label">سورة {surah.name} — الآية {ayah.number}</div>
         <div className="ayahText">{ayah.text}</div>
         <div className="controls">
           {!recording ? (
