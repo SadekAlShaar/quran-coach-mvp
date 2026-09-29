@@ -23,8 +23,13 @@ async def analyze(
     expected_text: str = Form(...),
     profile: str = Form("user"),
 ):
-    if surah != 1 or not 1 <= ayah <= 7:
-        raise HTTPException(400, "MVP currently supports Surah Al-Fatiha only.")
+    supported_surahs = {
+        1: 7,   # Al-Fatiha
+        98: 8,  # Al-Bayyinah
+    }
+    max_ayah = supported_surahs.get(surah)
+    if max_ayah is None or not 1 <= ayah <= max_ayah:
+        raise HTTPException(400, "This surah or ayah is not supported yet.")
 
     raw = await audio.read()
     if not raw:
