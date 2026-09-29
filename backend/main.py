@@ -4,7 +4,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from models import AnalysisResponse, WordResult
 from services.text_compare import align_words
-from services.transcription import transcribe_with_openai
+from services.transcription import transcribe_with_gemini
 from services.quran_model import analyze_with_quran_endpoint
 
 app = FastAPI(title="Quran Coach API", version="0.1.0")
@@ -51,25 +51,30 @@ async def analyze(
             # Fall through to word-level analyzer rather than making the app unusable.
             pass
 
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(
             503,
-            "No analysis engine configured. Add OPENAI_API_KEY for word-level feedback or QURAN_MODEL_ENDPOINT for phoneme/tajweed feedback.",
+            "No analysis engine configured. Add GEMINI_API_KEY for free-tier word-level feedback or QURAN_MODEL_ENDPOINT for phoneme/tajweed feedback.",
         )
 
     try:
-        transcript = await transcribe_with_openai(
+        transcript = await transcribe_with_gemini(
             raw,
             audio.filename or "recitation.webm",
             audio.content_type or "audio/webm",
             api_key,
-            os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"),
+            os.getenv("GEMINI_TRANSCRIBE_MODEL", "gemini-3.5-transcribe"),
         )
-    except httpx.HTTPStatusError as exc:  # type: ignore[name-defined]
-        raise HTTPException(502, f"Transcription provider error: {exc.response.status_code}")
+    except httpx.HTTPStatusError as exc:
+        detail = ""
+        try:
+            detail = exc.response.text[:500]
+        except Exception:
+            pass
+        raise HTTPException(502, f"Gemini transcription error: {exc.response.status_code} {detail}")
     except Exception as exc:
-        raise HTTPException(502, f"Could not transcribe audio: {type(exc).__name__}")
+        raise HTTPException(502, f"Could not transcribe audio with Gemini: {type(exc).__name__}: {exc}")
 
     aligned, score = align_words(expected_text, transcript)
     wrong = [x for x in aligned if x.status != "correct"]
