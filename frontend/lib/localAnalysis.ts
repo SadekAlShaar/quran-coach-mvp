@@ -116,13 +116,13 @@ export function analyzeTranscript(expectedText: string, heardText: string): Loca
   }
 
   items.reverse();
-  const expectedCount = Math.max(expectedOriginal.length, 1);
-  const penalties = items.reduce((sum, item) => {
-    if (item.status === "correct") return sum;
-    if (item.status === "wrong") return sum + 0.65;
-    return sum + 1;
-  }, 0);
-  const score = Math.round(Math.max(0, Math.min(100, (1 - penalties / expectedCount) * 100)));
+  // Strict Quran practice score: a word is either correct or it is not.
+  // Wrong/missing words receive no partial credit, and extra words also reduce
+  // the final percentage. This avoids misleading scores such as 35% when
+  // every expected word was marked wrong.
+  const correctCount = items.filter((item) => item.status === "correct").length;
+  const assessedCount = Math.max(items.length, expectedOriginal.length, 1);
+  const score = Math.round((correctCount / assessedCount) * 100);
   const mistakes = items.filter((item) => item.status !== "correct").length;
 
   let feedback = "ممتاز، الكلمات التي التقطها المتصفح مطابقة للآية ✅";
@@ -137,6 +137,6 @@ export function analyzeTranscript(expectedText: string, heardText: string): Loca
     words: items,
     feedback,
     warning:
-      "التصحيح هنا مبني على تحويل الكلام إلى نص من المتصفح، وليس فحصًا دقيقًا للمخارج أو أحكام التجويد.",
+      "التصحيح هنا مبني على نموذج تعرّف مخصص للتلاوة القرآنية ومقارنة الكلمات، وليس بعدُ فحصًا دقيقًا للمخارج أو أحكام التجويد.",
   };
 }
