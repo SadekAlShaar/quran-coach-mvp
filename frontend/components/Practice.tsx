@@ -31,7 +31,6 @@ export default function Practice() {
   const shouldAnalyzeRef = useRef(false);
   const keepListeningRef = useRef(false);
   const recognitionSessionRef = useRef(0);
-  const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wordAudio = useRef<HTMLAudioElement | null>(null);
   const ayahAudio = useRef<HTMLAudioElement | null>(null);
   const [playingWordPosition, setPlayingWordPosition] = useState<number | null>(null);
@@ -70,7 +69,6 @@ export default function Practice() {
     return () => {
       window.removeEventListener("beforeinstallprompt", handler as EventListener);
       keepListeningRef.current = false;
-      clearRecognitionRestartTimer();
       try { recognitionRef.current?.abort(); } catch {}
     };
   }, []);
@@ -120,6 +118,9 @@ export default function Practice() {
   }
 
   async function playAyahWithTajweed(): Promise<void> {
+    // iOS WebKit can break a later SpeechRecognition session if media plays
+    // while a recognizer is still around. Tear recognition down hard first.
+    hardResetRecognition();
     stopWordAudio();
     stopAyahAudio();
     setPlayingAyah(true);
@@ -131,6 +132,11 @@ export default function Practice() {
       player.onerror = () => reject(new Error("Could not load Quran ayah audio"));
       player.play().catch(reject);
     }).finally(() => {
+      try {
+        player.pause();
+        player.removeAttribute("src");
+        player.load();
+      } catch {}
       if (ayahAudio.current === player) ayahAudio.current = null;
       setPlayingAyah(false);
     });
@@ -146,6 +152,7 @@ export default function Practice() {
   }
 
   async function playWord(position: number): Promise<void> {
+    hardResetRecognition();
     stopAyahAudio();
     stopWordAudio();
     setPlayingWordPosition(position);
@@ -157,6 +164,11 @@ export default function Practice() {
       player.onerror = () => reject(new Error("Could not load Quran word audio"));
       player.play().catch(reject);
     }).finally(() => {
+      try {
+        player.pause();
+        player.removeAttribute("src");
+        player.load();
+      } catch {}
       if (wordAudio.current === player) wordAudio.current = null;
       setPlayingWordPosition((current) => (current === position ? null : current));
     });
@@ -205,11 +217,18 @@ export default function Practice() {
     setBusy(false);
   }
 
-  function clearRecognitionRestartTimer() {
-    if (restartTimerRef.current) {
-      clearTimeout(restartTimerRef.current);
-      restartTimerRef.current = null;
+  function hardResetRecognition() {
+    keepListeningRef.current = false;
+    shouldAnalyzeRef.current = false;
+    recognitionSessionRef.current += 1;
+    const recognition = recognitionRef.current;
+    recognitionRef.current = null;
+    if (recognition) {
+      try { recognition.onend = null; } catch {}
+      try { recognition.onerror = null; } catch {}
+      try { recognition.abort(); } catch {}
     }
+    setRecording(false);
   }
 
   function launchRecognition(sessionId: number) {
@@ -229,7 +248,10 @@ export default function Practice() {
     // A short recognition session is much more reliable across repeated attempts.
     // When Chrome/Safari ends it because of a pause, onend starts a fresh one while
     // the user is still in recording mode.
-    recognition.continuous = false;
+    // Keep one recognition session alive until the user taps "انتهيت".
+    // Auto-restarting from onend is unreliable on iPhone because a restart
+    // may happen without a fresh user gesture and WebKit can report not-allowed.
+    recognition.continuous = true;
     recognition.interimResults = true;
     recognition.maxAlternatives = 1;
 
@@ -262,12 +284,10 @@ export default function Practice() {
       if (error === "not-allowed" || error === "service-not-allowed") {
         keepListeningRef.current = false;
         setRecording(false);
-        setStatus("اسمح للمتصفح باستخدام الميكروفون ثم جرّب مرة ثانية.");
+        setStatus("المتصفح رفض جلسة التعرف الصوتي هالمرة. إذا الميكروفون مسموح أصلًا، لا تغيّر الإذن؛ اضغط «ابدأ القراءة» من جديد. على iPhone هذا خلل معروف في WebKit.");
       } else if (error === "no-speech") {
-        // no-speech is normal if the reader waits before starting or pauses.
-        // onend will create a fresh recognizer while recording is still active.
         if (keepListeningRef.current) {
-          setStatus("أنا بعدني عم اسمعك 🎙️ بلّش القراءة لما تكون جاهز.");
+          setStatus("ما سمعت كلام واضح. اضغط «ابدأ القراءة» مرة ثانية وبلّش مباشرة بعد الضغط.");
         }
       } else if (error === "aborted") {
         // Expected when changing surah/ayah or cleaning up an old recognizer.
@@ -281,11 +301,16 @@ export default function Practice() {
       if (sessionId !== recognitionSessionRef.current) return;
 
       if (keepListeningRef.current) {
-        clearRecognitionRestartTimer();
-        restartTimerRef.current = setTimeout(() => {
-          restartTimerRef.current = null;
-          launchRecognition(sessionId);
-        }, 180);
+        // Never auto-restart on iPhone. A timer-based restart can lose the
+        // direct user gesture and WebKit may return a fake permission error.
+        keepListeningRef.current = false;
+        setRecording(false);
+        const heard = (finalTranscriptRef.current || latestTranscriptRef.current).trim();
+        if (heard) {
+          finishAnalysis(heard);
+        } else {
+          setStatus("جلسة الاستماع انتهت. اضغط «ابدأ القراءة» مرة ثانية وابدأ القراءة مباشرة.");
+        }
         return;
       }
 
@@ -302,17 +327,13 @@ export default function Practice() {
     } catch (error) {
       console.error("Could not start SpeechRecognition", error);
       recognitionRef.current = null;
-      if (keepListeningRef.current && sessionId === recognitionSessionRef.current) {
-        clearRecognitionRestartTimer();
-        restartTimerRef.current = setTimeout(() => {
-          restartTimerRef.current = null;
-          launchRecognition(sessionId);
-        }, 300);
-      }
+      keepListeningRef.current = false;
+      setRecording(false);
+      setStatus("ما قدرت أبدأ جلسة الميكروفون. اضغط «ابدأ القراءة» مرة ثانية. إذا كنت على iPhone، ابدأ القراءة مباشرة بعد الضغط.");
     }
   }
 
-  async function startRecording() {
+  function startRecording() {
     if (recording || busy) return;
 
     setAnalysis(null);
@@ -321,7 +342,6 @@ export default function Practice() {
     latestTranscriptRef.current = "";
     shouldAnalyzeRef.current = false;
     keepListeningRef.current = true;
-    clearRecognitionRestartTimer();
 
     const SpeechRecognitionCtor = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRecognitionCtor) {
@@ -331,24 +351,26 @@ export default function Practice() {
       return;
     }
 
-    // In case an old browser recognizer is still shutting down, invalidate it first.
+    // Important for iPhone: start recognition synchronously from the button
+    // tap. Do not await/setTimeout here or WebKit may treat it as lacking a
+    // fresh user gesture and return not-allowed even when permission is granted.
     recognitionSessionRef.current += 1;
     const sessionId = recognitionSessionRef.current;
     const oldRecognition = recognitionRef.current;
     recognitionRef.current = null;
     if (oldRecognition) {
+      try { oldRecognition.onend = null; } catch {}
+      try { oldRecognition.onerror = null; } catch {}
       try { oldRecognition.abort(); } catch {}
-      await new Promise((resolve) => setTimeout(resolve, 180));
     }
 
     setRecording(true);
-    setStatus("عم اسمعك… اقرأ بهدوء وبصوت واضح 🎙️");
+    setStatus("عم اسمعك… بلّش القراءة مباشرة 🎙️");
     launchRecognition(sessionId);
   }
 
   function stopRecognition(analyze: boolean) {
     keepListeningRef.current = false;
-    clearRecognitionRestartTimer();
     shouldAnalyzeRef.current = analyze;
 
     if (analyze) {
@@ -515,7 +537,7 @@ export default function Practice() {
       </section>
 
       <div className="notice">
-        ✅ الوضع الحالي بلا Gemini/OpenAI ولا يحتاج API key أو بطاقة. التعرف على الكلام يتم عبر ميزة المتصفح وقد يعتمد المتصفح نفسه على خدمة صوتية خارجية. ⚠️ هذا ليس فحص تجويد دقيقًا للمخارج والمدود والغنة.
+        ✅ الوضع الحالي بلا Gemini/OpenAI ولا يحتاج API key أو بطاقة. التعرف على الكلام يتم عبر ميزة المتصفح وقد يعتمد المتصفح نفسه على خدمة صوتية خارجية. ⚠️ على iPhone يوجد خلل معروف في WebKit مع إعادة تشغيل SpeechRecognition، لذلك ابدأ القراءة مباشرة بعد الضغط على زر الميكروفون. هذا ليس فحص تجويد دقيقًا للمخارج والمدود والغنة.
       </div>
     </main>
   );
