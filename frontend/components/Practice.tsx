@@ -13,6 +13,50 @@ type PositionedWord = WordResult & {
 
 const PROFILES = ["أبي", "أمي", "أنا"];
 
+function preferredAudioMimeType(): string | undefined {
+  if (typeof MediaRecorder === "undefined" || typeof MediaRecorder.isTypeSupported !== "function") {
+    return undefined;
+  }
+
+  const candidates = [
+    "audio/mp4;codecs=mp4a.40.2",
+    "audio/mp4",
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+  ];
+
+  return candidates.find((type) => MediaRecorder.isTypeSupported(type));
+}
+
+async function decodeAndResampleTo16k(blob: Blob): Promise<Float32Array> {
+  const encoded = await blob.arrayBuffer();
+  const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext;
+  if (!AudioContextCtor) throw new Error("AudioContext is not supported on this device.");
+
+  const context = new AudioContextCtor();
+  try {
+    const decoded = await context.decodeAudioData(encoded.slice(0));
+    if (!decoded.duration || decoded.duration < 0.15) {
+      throw new Error("Recording is too short.");
+    }
+
+    const targetRate = 16000;
+    const targetLength = Math.max(1, Math.ceil(decoded.duration * targetRate));
+    const offline = new OfflineAudioContext(1, targetLength, targetRate);
+    const source = offline.createBufferSource();
+    source.buffer = decoded;
+    source.connect(offline.destination);
+    source.start(0);
+    const rendered = await offline.startRendering();
+
+    // Copy the channel so the returned Float32Array owns a transferable buffer.
+    return new Float32Array(rendered.getChannelData(0));
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
 export default function Practice() {
   const [profile, setProfile] = useState("أنا");
   const [surahNo, setSurahNo] = useState(1);
@@ -22,15 +66,29 @@ export default function Practice() {
   const [status, setStatus] = useState("اضغط على الميكروفون واقرأ الآية كاملة.");
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [installPrompt, setInstallPrompt] = useState<any>(null);
-  const [speechSupported, setSpeechSupported] = useState(true);
-  const [liveTranscript, setLiveTranscript] = useState("");
+  const [recorderSupported, setRecorderSupported] = useState(true);
+  const [modelReady, setModelReady] = useState(false);
+  const [modelLoading, setModelLoading] = useState(false);
+  const [modelProgress, setModelProgress] = useState<number | null>(null);
 
-  const recognitionRef = useRef<any>(null);
-  const finalTranscriptRef = useRef("");
-  const latestTranscriptRef = useRef("");
-  const shouldAnalyzeRef = useRef(false);
-  const keepListeningRef = useRef(false);
-  const recognitionSessionRef = useRef(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const chunksRef = useRef<BlobPart[]>([]);
+  const discardRecordingRef = useRef(false);
+  const workerRef = useRef<Worker | null>(null);
+  const pendingAudioRef = useRef<Float32Array | null>(null);
+  const attemptContextRef = useRef<{
+    profile: string;
+    surahNo: number;
+    ayahNo: number;
+    expectedText: string;
+  } | null>(null);
+
+  // The Whisper worker listener is created once. Keep the latest UI selection in
+  // a ref so async results are compared with the current ayah/profile instead of
+  // the values captured by the first React render.
+  const currentSelectionRef = useRef({ profile, surahNo, ayahNo });
+
   const wordAudio = useRef<HTMLAudioElement | null>(null);
   const ayahAudio = useRef<HTMLAudioElement | null>(null);
   const [playingWordPosition, setPlayingWordPosition] = useState<number | null>(null);
@@ -39,6 +97,10 @@ export default function Practice() {
 
   const surah = useMemo(() => surahs.find((s) => s.number === surahNo) ?? surahs[0], [surahNo]);
   const ayah = useMemo(() => surah.ayahs.find((a) => a.number === ayahNo) ?? surah.ayahs[0], [surah, ayahNo]);
+
+  useEffect(() => {
+    currentSelectionRef.current = { profile, surahNo, ayahNo };
+  }, [profile, surahNo, ayahNo]);
 
   const wordsWithPositions = useMemo<PositionedWord[]>(() => {
     if (!analysis) return [];
@@ -57,8 +119,62 @@ export default function Practice() {
     const saved = localStorage.getItem("quran-coach-profile");
     if (saved) setProfile(saved);
 
-    const SpeechRecognitionCtor = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    setSpeechSupported(Boolean(SpeechRecognitionCtor));
+    setRecorderSupported(
+      typeof navigator !== "undefined" &&
+      Boolean(navigator.mediaDevices?.getUserMedia) &&
+      typeof MediaRecorder !== "undefined"
+    );
+
+    const worker = new Worker(new URL("../workers/quran.worker.ts", import.meta.url), { type: "module" });
+    workerRef.current = worker;
+
+    worker.onmessage = (event: MessageEvent) => {
+      const message = event.data ?? {};
+
+      if (message.type === "model-loading") {
+        setModelLoading(true);
+        setStatus("أول مرة فقط: عم نزّل محرك التعرّف القرآني على الجهاز (~104 MB)…");
+        return;
+      }
+
+      if (message.type === "model-progress") {
+        const progress = typeof message.progress === "number" ? message.progress : null;
+        if (progress !== null && Number.isFinite(progress)) {
+          const normalized = progress <= 1 ? progress * 100 : progress;
+          setModelProgress(Math.max(0, Math.min(100, Math.round(normalized))));
+        }
+        return;
+      }
+
+      if (message.type === "model-ready") {
+        setModelReady(true);
+        setModelLoading(false);
+        setModelProgress(100);
+        if (!busy && !recording) setStatus("محرك التصحيح جاهز ✅");
+        return;
+      }
+
+      if (message.type === "transcribing") {
+        setBusy(true);
+        setStatus("عم حلّل التلاوة بالמודيل القرآني على جهازك…");
+        return;
+      }
+
+      if (message.type === "result") {
+        const transcript = String(message.text ?? "").trim();
+        pendingAudioRef.current = null;
+        finishAnalysis(transcript);
+        return;
+      }
+
+      if (message.type === "error") {
+        console.error("Local Quran ASR error", message.message);
+        pendingAudioRef.current = null;
+        setBusy(false);
+        setModelLoading(false);
+        setStatus("صار خطأ أثناء التحليل القرآني المحلي. إذا كانت أول مرة، تأكد أن الإنترنت شغال حتى ينزل الموديل، وبعدها جرّب مرة ثانية.");
+      }
+    };
 
     const handler = (e: Event) => {
       e.preventDefault();
@@ -66,11 +182,14 @@ export default function Practice() {
     };
     window.addEventListener("beforeinstallprompt", handler as EventListener);
     if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
+
     return () => {
       window.removeEventListener("beforeinstallprompt", handler as EventListener);
-      keepListeningRef.current = false;
-      try { recognitionRef.current?.abort(); } catch {}
+      worker.terminate();
+      workerRef.current = null;
+      cleanupRecorder(true);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function chooseProfile(name: string) {
@@ -79,13 +198,13 @@ export default function Practice() {
   }
 
   function chooseSurah(nextSurahNo: number) {
-    stopRecognition(false);
+    cleanupRecorder(true);
     stopWordAudio();
     stopAyahAudio();
     setSurahNo(nextSurahNo);
     setAyahNo(1);
+    attemptContextRef.current = null;
     setAnalysis(null);
-    setLiveTranscript("");
     setStatus("اضغط على الميكروفون واقرأ الآية كاملة.");
   }
 
@@ -118,9 +237,7 @@ export default function Practice() {
   }
 
   async function playAyahWithTajweed(): Promise<void> {
-    // iOS WebKit can break a later SpeechRecognition session if media plays
-    // while a recognizer is still around. Tear recognition down hard first.
-    hardResetRecognition();
+    cleanupRecorder(true);
     stopWordAudio();
     stopAyahAudio();
     setPlayingAyah(true);
@@ -152,7 +269,7 @@ export default function Practice() {
   }
 
   async function playWord(position: number): Promise<void> {
-    hardResetRecognition();
+    cleanupRecorder(true);
     stopAyahAudio();
     stopWordAudio();
     setPlayingWordPosition(position);
@@ -197,218 +314,184 @@ export default function Practice() {
   }
 
   function finishAnalysis(transcript: string) {
-    setBusy(true);
     const cleanTranscript = transcript.trim();
+    const attempt = attemptContextRef.current;
+    attemptContextRef.current = null;
 
-    if (!cleanTranscript) {
-      setAnalysis(null);
-      setStatus("ما قدرت أسمع كلمات واضحة. قرّب الموبايل واحكي بصوت أوضح ثم جرّب مرة ثانية.");
+    if (!attempt) {
+      // The user changed surah/ayah or cancelled while Whisper was working.
       setBusy(false);
       return;
     }
 
-    const result = analyzeTranscript(ayah.simpleText, cleanTranscript);
+    // Never show an old result under a newly selected ayah. Use the latest
+    // selection ref here because this callback is invoked asynchronously by a
+    // worker whose listener was registered on the first render.
+    const current = currentSelectionRef.current;
+    if (
+      attempt.surahNo !== current.surahNo ||
+      attempt.ayahNo !== current.ayahNo ||
+      attempt.profile !== current.profile
+    ) {
+      setBusy(false);
+      setStatus("تم تجاهل نتيجة قديمة لأنك غيّرت السورة أو الآية.");
+      return;
+    }
+
+    if (!cleanTranscript) {
+      setAnalysis(null);
+      setStatus("الموديل القرآني ما التقط كلمات واضحة. قرّب الموبايل، ارفع صوتك شوي، وجرب مرة ثانية.");
+      setBusy(false);
+      return;
+    }
+
+    const result = analyzeTranscript(attempt.expectedText, cleanTranscript);
     setAnalysis(result);
     setStatus(result.feedback);
     localStorage.setItem(
-      `progress-${profile}-${surah.number}-${ayah.number}`,
+      `progress-${attempt.profile}-${attempt.surahNo}-${attempt.ayahNo}`,
       JSON.stringify({ score: result.score, at: new Date().toISOString() })
     );
     setBusy(false);
   }
 
-  function hardResetRecognition() {
-    keepListeningRef.current = false;
-    shouldAnalyzeRef.current = false;
-    recognitionSessionRef.current += 1;
-    const recognition = recognitionRef.current;
-    recognitionRef.current = null;
-    if (recognition) {
-      try { recognition.onend = null; } catch {}
-      try { recognition.onerror = null; } catch {}
-      try { recognition.abort(); } catch {}
+  function releaseStream() {
+    if (mediaStreamRef.current) {
+      for (const track of mediaStreamRef.current.getTracks()) track.stop();
+      mediaStreamRef.current = null;
     }
+  }
+
+  function cleanupRecorder(discard: boolean) {
+    discardRecordingRef.current = discard;
+    const recorder = mediaRecorderRef.current;
+    mediaRecorderRef.current = null;
+
+    if (recorder && recorder.state !== "inactive") {
+      try { recorder.stop(); } catch {}
+    }
+
+    releaseStream();
+    if (discard) chunksRef.current = [];
     setRecording(false);
   }
 
-  function launchRecognition(sessionId: number) {
-    if (!keepListeningRef.current || sessionId !== recognitionSessionRef.current) return;
-
-    const SpeechRecognitionCtor = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognitionCtor) {
-      setSpeechSupported(false);
-      keepListeningRef.current = false;
-      setRecording(false);
-      setStatus("هذا المتصفح لا يدعم التعرف الصوتي المجاني. جرّب Chrome على Android/Windows أو Safari حديث على iPhone.");
-      return;
-    }
-
-    const recognition = new SpeechRecognitionCtor();
-    recognition.lang = "ar-SA";
-    // A short recognition session is much more reliable across repeated attempts.
-    // When Chrome/Safari ends it because of a pause, onend starts a fresh one while
-    // the user is still in recording mode.
-    // Keep one recognition session alive until the user taps "انتهيت".
-    // Auto-restarting from onend is unreliable on iPhone because a restart
-    // may happen without a fresh user gesture and WebKit can report not-allowed.
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
-
-    recognition.onresult = (event: any) => {
-      if (sessionId !== recognitionSessionRef.current) return;
-
-      let finalPart = "";
-      let interimPart = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const spoken = event.results[i][0]?.transcript ?? "";
-        if (event.results[i].isFinal) finalPart += ` ${spoken}`;
-        else interimPart += ` ${spoken}`;
-      }
-
-      if (finalPart.trim()) {
-        finalTranscriptRef.current = `${finalTranscriptRef.current} ${finalPart}`.trim();
-      }
-
-      const combined = `${finalTranscriptRef.current} ${interimPart}`.trim();
-      latestTranscriptRef.current = combined;
-      setLiveTranscript(combined);
-      if (combined) setStatus(`عم اسمعك… ${combined}`);
-    };
-
-    recognition.onerror = (event: any) => {
-      if (sessionId !== recognitionSessionRef.current) return;
-      const error = event?.error;
-      console.error("SpeechRecognition error", error);
-
-      if (error === "not-allowed" || error === "service-not-allowed") {
-        keepListeningRef.current = false;
-        setRecording(false);
-        setStatus("المتصفح رفض جلسة التعرف الصوتي هالمرة. إذا الميكروفون مسموح أصلًا، لا تغيّر الإذن؛ اضغط «ابدأ القراءة» من جديد. على iPhone هذا خلل معروف في WebKit.");
-      } else if (error === "no-speech") {
-        if (keepListeningRef.current) {
-          setStatus("ما سمعت كلام واضح. اضغط «ابدأ القراءة» مرة ثانية وبلّش مباشرة بعد الضغط.");
-        }
-      } else if (error === "aborted") {
-        // Expected when changing surah/ayah or cleaning up an old recognizer.
-      } else {
-        setStatus("التعرف الصوتي توقف للحظة. عم حاول اسمعك من جديد…");
-      }
-    };
-
-    recognition.onend = () => {
-      if (recognitionRef.current === recognition) recognitionRef.current = null;
-      if (sessionId !== recognitionSessionRef.current) return;
-
-      if (keepListeningRef.current) {
-        // Never auto-restart on iPhone. A timer-based restart can lose the
-        // direct user gesture and WebKit may return a fake permission error.
-        keepListeningRef.current = false;
-        setRecording(false);
-        const heard = (finalTranscriptRef.current || latestTranscriptRef.current).trim();
-        if (heard) {
-          finishAnalysis(heard);
-        } else {
-          setStatus("جلسة الاستماع انتهت. اضغط «ابدأ القراءة» مرة ثانية وابدأ القراءة مباشرة.");
-        }
-        return;
-      }
-
-      setRecording(false);
-      if (shouldAnalyzeRef.current) {
-        shouldAnalyzeRef.current = false;
-        finishAnalysis(finalTranscriptRef.current || latestTranscriptRef.current);
-      }
-    };
-
-    recognitionRef.current = recognition;
+  async function sendRecordingForAnalysis(blob: Blob) {
     try {
-      recognition.start();
-    } catch (error) {
-      console.error("Could not start SpeechRecognition", error);
-      recognitionRef.current = null;
-      keepListeningRef.current = false;
-      setRecording(false);
-      setStatus("ما قدرت أبدأ جلسة الميكروفون. اضغط «ابدأ القراءة» مرة ثانية. إذا كنت على iPhone، ابدأ القراءة مباشرة بعد الضغط.");
-    }
-  }
-
-  function startRecording() {
-    if (recording || busy) return;
-
-    setAnalysis(null);
-    setLiveTranscript("");
-    finalTranscriptRef.current = "";
-    latestTranscriptRef.current = "";
-    shouldAnalyzeRef.current = false;
-    keepListeningRef.current = true;
-
-    const SpeechRecognitionCtor = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognitionCtor) {
-      setSpeechSupported(false);
-      keepListeningRef.current = false;
-      setStatus("هذا المتصفح لا يدعم التعرف الصوتي المجاني. جرّب Chrome على Android/Windows أو Safari حديث على iPhone.");
-      return;
-    }
-
-    // Important for iPhone: start recognition synchronously from the button
-    // tap. Do not await/setTimeout here or WebKit may treat it as lacking a
-    // fresh user gesture and return not-allowed even when permission is granted.
-    recognitionSessionRef.current += 1;
-    const sessionId = recognitionSessionRef.current;
-    const oldRecognition = recognitionRef.current;
-    recognitionRef.current = null;
-    if (oldRecognition) {
-      try { oldRecognition.onend = null; } catch {}
-      try { oldRecognition.onerror = null; } catch {}
-      try { oldRecognition.abort(); } catch {}
-    }
-
-    setRecording(true);
-    setStatus("عم اسمعك… بلّش القراءة مباشرة 🎙️");
-    launchRecognition(sessionId);
-  }
-
-  function stopRecognition(analyze: boolean) {
-    keepListeningRef.current = false;
-    shouldAnalyzeRef.current = analyze;
-
-    if (analyze) {
       setBusy(true);
-      setStatus("عم قارن القراءة مع الآية على الجهاز…");
-    }
+      setStatus(modelReady ? "عم حضّر الصوت للتحليل القرآني…" : "عم حضّر الصوت، وأول مرة رح ينزل الموديل القرآني…");
 
-    const recognition = recognitionRef.current;
-    if (!recognition) {
-      setRecording(false);
-      if (analyze) {
-        shouldAnalyzeRef.current = false;
-        finishAnalysis(finalTranscriptRef.current || latestTranscriptRef.current);
-      }
+      const audio = await decodeAndResampleTo16k(blob);
+      // blob and encoded bytes are now eligible for garbage collection. Only the
+      // model remains cached by Transformers.js; recordings are not persisted.
+      pendingAudioRef.current = audio;
+      const buffer = audio.buffer;
+      workerRef.current?.postMessage({ type: "transcribe", audio: buffer }, [buffer]);
+    } catch (error) {
+      console.error("Could not prepare recording", error);
+      pendingAudioRef.current = null;
+      setBusy(false);
+      setStatus("ما قدرت أقرأ ملف التسجيل على هالجهاز. جرّب مرة ثانية.");
+    }
+  }
+
+  async function startRecording() {
+    if (recording || busy) return;
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setRecorderSupported(false);
+      setStatus("هذا الجهاز ما بيدعم التسجيل المطلوب. جرّب Safari أو Chrome حديث.");
       return;
     }
 
+    stopWordAudio();
+    stopAyahAudio();
+    setAnalysis(null);
+    discardRecordingRef.current = false;
+    chunksRef.current = [];
+    attemptContextRef.current = {
+      profile,
+      surahNo: surah.number,
+      ayahNo: ayah.number,
+      expectedText: ayah.simpleText,
+    };
+
     try {
-      recognition.stop();
-    } catch {
-      recognitionRef.current = null;
+      setStatus("عم افتح الميكروفون…");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      mediaStreamRef.current = stream;
+
+      const mimeType = preferredAudioMimeType();
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data?.size) chunksRef.current.push(event.data);
+      };
+
+      recorder.onerror = (event) => {
+        console.error("MediaRecorder error", event);
+        setStatus("صار خطأ بالتسجيل. جرّب مرة ثانية.");
+        cleanupRecorder(true);
+      };
+
+      recorder.onstop = () => {
+        const discard = discardRecordingRef.current;
+        const chunks = chunksRef.current;
+        chunksRef.current = [];
+        releaseStream();
+        setRecording(false);
+
+        if (discard || chunks.length === 0) return;
+
+        const type = recorder.mimeType || mimeType || "audio/webm";
+        const blob = new Blob(chunks, { type });
+        void sendRecordingForAnalysis(blob);
+      };
+
+      // Warm up/download the Quran-specific FastConformer while the user is reading.
+      // The model/assets are cached in browser Cache Storage for later attempts.
+      if (!modelReady && !modelLoading) workerRef.current?.postMessage({ type: "load" });
+
+      recorder.start(250);
+      setRecording(true);
+      setStatus("عم سجّل… اقرأ الآية، ولما تخلص اضغط «انتهيت» 🎙️");
+    } catch (error: any) {
+      console.error("Could not access microphone", error);
+      releaseStream();
+      attemptContextRef.current = null;
       setRecording(false);
-      if (analyze) {
-        shouldAnalyzeRef.current = false;
-        finishAnalysis(finalTranscriptRef.current || latestTranscriptRef.current);
+      if (error?.name === "NotAllowedError" || error?.name === "SecurityError") {
+        setStatus("المتصفح ما أعطى إذن للميكروفون. افتح إعدادات الموقع واسمح بالميكروفون ثم جرّب مرة ثانية.");
+      } else {
+        setStatus("ما قدرت افتح الميكروفون. جرّب إغلاق أي تطبيق ثاني يستخدم المايك ثم أعد المحاولة.");
       }
     }
   }
 
   function stopRecording() {
-    stopRecognition(true);
+    if (!recording) return;
+    discardRecordingRef.current = false;
+    setStatus("تم التسجيل. عم جهّز القراءة للتحليل…");
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      try { recorder.stop(); } catch {
+        cleanupRecorder(true);
+        setStatus("ما قدرت أنهي التسجيل بشكل صحيح. جرّب مرة ثانية.");
+      }
+    }
   }
 
   return (
     <main>
       <section className="hero">
         <h1>مدرّب التلاوة 🌙</h1>
-        <p>اقرأ الآية وخذ ملاحظة على الكلمات التي تحتاج إعادة. هذا الوضع لا يستخدم Gemini أو OpenAI ولا يحتاج بطاقة دفع.</p>
+        <p>سجّل الآية، والموديل القرآني FastConformer يحللها محليًا على جهازك. ما في Gemini أو OpenAI API، والتسجيل نفسه ما بينحفظ.</p>
         {installPrompt && (
           <div className="controls">
             <button className="secondary" onClick={installApp}>📲 ثبّت التطبيق على الموبايل</button>
@@ -436,12 +519,12 @@ export default function Practice() {
           <select
             value={ayahNo}
             onChange={(e) => {
-              stopRecognition(false);
+              cleanupRecorder(true);
               stopWordAudio();
               stopAyahAudio();
               setAyahNo(Number(e.target.value));
+              attemptContextRef.current = null;
               setAnalysis(null);
-              setLiveTranscript("");
               setStatus("اضغط على الميكروفون واقرأ الآية كاملة.");
             }}
           >
@@ -469,23 +552,29 @@ export default function Practice() {
 
         <div className="controls">
           {!recording ? (
-            <button className="primary" onClick={startRecording} disabled={busy || !speechSupported}>🎙️ ابدأ القراءة</button>
+            <button className="primary" onClick={startRecording} disabled={busy || !recorderSupported}>🎙️ ابدأ القراءة</button>
           ) : (
             <button className="danger" onClick={stopRecording}>⏹️ انتهيت</button>
           )}
         </div>
 
-        {!speechSupported && (
-          <div className="status error">المتصفح الحالي لا يدعم SpeechRecognition. افتح التطبيق بمتصفح يدعم التعرف الصوتي.</div>
+        {!recorderSupported && (
+          <div className="status error">المتصفح الحالي ما بيدعم MediaRecorder. افتح التطبيق على Safari أو Chrome حديث.</div>
         )}
 
-        {liveTranscript && recording && <div className="small">ما يسمعه المتصفح الآن: {liveTranscript}</div>}
-        <div className="status info">{busy ? "عم قارن القراءة مع الآية…" : status}</div>
+        {(modelLoading || (busy && !modelReady)) && (
+          <div className="status info">
+            أول استخدام فقط: عم يجهّز موديل القرآن على الجهاز
+            {modelProgress !== null ? ` — ${modelProgress}%` : "…"}
+          </div>
+        )}
+
+        <div className="status info">{status}</div>
 
         {analysis && (
           <div className="result">
             <div className="score">النتيجة: {analysis.score}%</div>
-            <div className="small">ما سمعه المتصفح: {analysis.transcript || "—"}</div>
+            <div className="small">ما التقطه الموديل القرآني: {analysis.transcript || "—"}</div>
             <div className="words">
               {wordsWithPositions.map((w) => (
                 <div className="wordResult" key={`${w.expected}-${w.resultIndex}`}>
@@ -537,7 +626,7 @@ export default function Practice() {
       </section>
 
       <div className="notice">
-        ✅ الوضع الحالي بلا Gemini/OpenAI ولا يحتاج API key أو بطاقة. التعرف على الكلام يتم عبر ميزة المتصفح وقد يعتمد المتصفح نفسه على خدمة صوتية خارجية. ⚠️ على iPhone يوجد خلل معروف في WebKit مع إعادة تشغيل SpeechRecognition، لذلك ابدأ القراءة مباشرة بعد الضغط على زر الميكروفون. هذا ليس فحص تجويد دقيقًا للمخارج والمدود والغنة.
+        ✅ مجاني بالكامل: التسجيل مؤقت ولا يُحفظ. موديل القرآن وملفاته فقط تُخزّن في كاش المتصفح بعد أول تحميل. ⚠️ هذا الإصدار يصحح الكلمات باستخدام موديل مخصص لتلاوة القرآن؛ تقييم المخارج والمد والغنة بدقة سيكون مرحلة منفصلة.
       </div>
     </main>
   );

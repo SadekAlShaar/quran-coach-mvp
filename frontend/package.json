@@ -9,9 +9,11 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "next": "^15.5.26",
+    "next": "15.5.26",
     "react": "19.1.1",
-    "react-dom": "19.1.1"
+    "react-dom": "19.1.1",
+    "@tilawi/quran-asr": "^0.1.0",
+    "onnxruntime-web": "^1.24.2"
   },
   "devDependencies": {
     "@types/node": "24.5.2",
