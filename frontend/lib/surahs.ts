@@ -25,6 +25,13 @@ export const surahs: Surah[] = [
     ]
   },
   {
+    number: 78,
+    name: "ٱلنَّبَإِ",
+    ayahs:[
+      {number:1, text: "عَمَّ يَتَسَآءَلُونَ",simpleText: "عَمَّ يَتَسَآءَلُونَ"}
+    ]
+  },
+  {
     number: 98,
     name: "البينة",
     ayahs: [
