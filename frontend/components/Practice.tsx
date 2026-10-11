@@ -29,6 +29,9 @@ export default function Practice() {
   const finalTranscriptRef = useRef("");
   const latestTranscriptRef = useRef("");
   const shouldAnalyzeRef = useRef(false);
+  const keepListeningRef = useRef(false);
+  const recognitionSessionRef = useRef(0);
+  const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wordAudio = useRef<HTMLAudioElement | null>(null);
   const ayahAudio = useRef<HTMLAudioElement | null>(null);
   const [playingWordPosition, setPlayingWordPosition] = useState<number | null>(null);
@@ -64,7 +67,12 @@ export default function Practice() {
     };
     window.addEventListener("beforeinstallprompt", handler as EventListener);
     if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
-    return () => window.removeEventListener("beforeinstallprompt", handler as EventListener);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", handler as EventListener);
+      keepListeningRef.current = false;
+      clearRecognitionRestartTimer();
+      try { recognitionRef.current?.abort(); } catch {}
+    };
   }, []);
 
   function chooseProfile(name: string) {
@@ -197,89 +205,165 @@ export default function Practice() {
     setBusy(false);
   }
 
+  function clearRecognitionRestartTimer() {
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+  }
+
+  function launchRecognition(sessionId: number) {
+    if (!keepListeningRef.current || sessionId !== recognitionSessionRef.current) return;
+
+    const SpeechRecognitionCtor = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognitionCtor) {
+      setSpeechSupported(false);
+      keepListeningRef.current = false;
+      setRecording(false);
+      setStatus("هذا المتصفح لا يدعم التعرف الصوتي المجاني. جرّب Chrome على Android/Windows أو Safari حديث على iPhone.");
+      return;
+    }
+
+    const recognition = new SpeechRecognitionCtor();
+    recognition.lang = "ar-SA";
+    // A short recognition session is much more reliable across repeated attempts.
+    // When Chrome/Safari ends it because of a pause, onend starts a fresh one while
+    // the user is still in recording mode.
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
+
+    recognition.onresult = (event: any) => {
+      if (sessionId !== recognitionSessionRef.current) return;
+
+      let finalPart = "";
+      let interimPart = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const spoken = event.results[i][0]?.transcript ?? "";
+        if (event.results[i].isFinal) finalPart += ` ${spoken}`;
+        else interimPart += ` ${spoken}`;
+      }
+
+      if (finalPart.trim()) {
+        finalTranscriptRef.current = `${finalTranscriptRef.current} ${finalPart}`.trim();
+      }
+
+      const combined = `${finalTranscriptRef.current} ${interimPart}`.trim();
+      latestTranscriptRef.current = combined;
+      setLiveTranscript(combined);
+      if (combined) setStatus(`عم اسمعك… ${combined}`);
+    };
+
+    recognition.onerror = (event: any) => {
+      if (sessionId !== recognitionSessionRef.current) return;
+      const error = event?.error;
+      console.error("SpeechRecognition error", error);
+
+      if (error === "not-allowed" || error === "service-not-allowed") {
+        keepListeningRef.current = false;
+        setRecording(false);
+        setStatus("اسمح للمتصفح باستخدام الميكروفون ثم جرّب مرة ثانية.");
+      } else if (error === "no-speech") {
+        // no-speech is normal if the reader waits before starting or pauses.
+        // onend will create a fresh recognizer while recording is still active.
+        if (keepListeningRef.current) {
+          setStatus("أنا بعدني عم اسمعك 🎙️ بلّش القراءة لما تكون جاهز.");
+        }
+      } else if (error === "aborted") {
+        // Expected when changing surah/ayah or cleaning up an old recognizer.
+      } else {
+        setStatus("التعرف الصوتي توقف للحظة. عم حاول اسمعك من جديد…");
+      }
+    };
+
+    recognition.onend = () => {
+      if (recognitionRef.current === recognition) recognitionRef.current = null;
+      if (sessionId !== recognitionSessionRef.current) return;
+
+      if (keepListeningRef.current) {
+        clearRecognitionRestartTimer();
+        restartTimerRef.current = setTimeout(() => {
+          restartTimerRef.current = null;
+          launchRecognition(sessionId);
+        }, 180);
+        return;
+      }
+
+      setRecording(false);
+      if (shouldAnalyzeRef.current) {
+        shouldAnalyzeRef.current = false;
+        finishAnalysis(finalTranscriptRef.current || latestTranscriptRef.current);
+      }
+    };
+
+    recognitionRef.current = recognition;
+    try {
+      recognition.start();
+    } catch (error) {
+      console.error("Could not start SpeechRecognition", error);
+      recognitionRef.current = null;
+      if (keepListeningRef.current && sessionId === recognitionSessionRef.current) {
+        clearRecognitionRestartTimer();
+        restartTimerRef.current = setTimeout(() => {
+          restartTimerRef.current = null;
+          launchRecognition(sessionId);
+        }, 300);
+      }
+    }
+  }
+
   async function startRecording() {
+    if (recording || busy) return;
+
     setAnalysis(null);
     setLiveTranscript("");
     finalTranscriptRef.current = "";
     latestTranscriptRef.current = "";
     shouldAnalyzeRef.current = false;
+    keepListeningRef.current = true;
+    clearRecognitionRestartTimer();
 
     const SpeechRecognitionCtor = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRecognitionCtor) {
       setSpeechSupported(false);
+      keepListeningRef.current = false;
       setStatus("هذا المتصفح لا يدعم التعرف الصوتي المجاني. جرّب Chrome على Android/Windows أو Safari حديث على iPhone.");
       return;
     }
 
-    try {
-      // Asking explicitly first gives a clearer permission flow on phones.
-      const permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      permissionStream.getTracks().forEach((track) => track.stop());
-
-      const recognition = new SpeechRecognitionCtor();
-      recognition.lang = "ar-SA";
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.maxAlternatives = 1;
-
-      recognition.onresult = (event: any) => {
-        let finalPart = "";
-        let interimPart = "";
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const text = event.results[i][0]?.transcript ?? "";
-          if (event.results[i].isFinal) finalPart += ` ${text}`;
-          else interimPart += ` ${text}`;
-        }
-        if (finalPart.trim()) {
-          finalTranscriptRef.current = `${finalTranscriptRef.current} ${finalPart}`.trim();
-        }
-        const combined = `${finalTranscriptRef.current} ${interimPart}`.trim();
-        latestTranscriptRef.current = combined;
-        setLiveTranscript(combined);
-        if (combined) setStatus(`عم اسمعك… ${combined}`);
-      };
-
-      recognition.onerror = (event: any) => {
-        console.error("SpeechRecognition error", event?.error);
-        if (event?.error === "not-allowed" || event?.error === "service-not-allowed") {
-          setStatus("اسمح للمتصفح باستخدام الميكروفون ثم جرّب مرة ثانية.");
-        } else if (event?.error === "no-speech") {
-          setStatus("ما سمعت كلام واضح. جرّب مرة ثانية بصوت أعلى شوي.");
-        } else {
-          setStatus("التعرف الصوتي توقف. جرّب مرة ثانية.");
-        }
-      };
-
-      recognition.onend = () => {
-        recognitionRef.current = null;
-        setRecording(false);
-        if (shouldAnalyzeRef.current) {
-          shouldAnalyzeRef.current = false;
-          finishAnalysis(finalTranscriptRef.current || latestTranscriptRef.current);
-        }
-      };
-
-      recognitionRef.current = recognition;
-      recognition.start();
-      setRecording(true);
-      setStatus("عم اسمعك… اقرأ بهدوء وبصوت واضح 🎙️");
-    } catch (error) {
-      console.error(error);
-      setStatus("ما قدرت أوصل للميكروفون. اسمح للتطبيق باستخدام الميكروفون من إعدادات المتصفح.");
+    // In case an old browser recognizer is still shutting down, invalidate it first.
+    recognitionSessionRef.current += 1;
+    const sessionId = recognitionSessionRef.current;
+    const oldRecognition = recognitionRef.current;
+    recognitionRef.current = null;
+    if (oldRecognition) {
+      try { oldRecognition.abort(); } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 180));
     }
+
+    setRecording(true);
+    setStatus("عم اسمعك… اقرأ بهدوء وبصوت واضح 🎙️");
+    launchRecognition(sessionId);
   }
 
   function stopRecognition(analyze: boolean) {
-    const recognition = recognitionRef.current;
-    if (!recognition) {
-      setRecording(false);
-      return;
-    }
-
+    keepListeningRef.current = false;
+    clearRecognitionRestartTimer();
     shouldAnalyzeRef.current = analyze;
+
     if (analyze) {
       setBusy(true);
       setStatus("عم قارن القراءة مع الآية على الجهاز…");
+    }
+
+    const recognition = recognitionRef.current;
+    if (!recognition) {
+      setRecording(false);
+      if (analyze) {
+        shouldAnalyzeRef.current = false;
+        finishAnalysis(finalTranscriptRef.current || latestTranscriptRef.current);
+      }
+      return;
     }
 
     try {
@@ -287,7 +371,10 @@ export default function Practice() {
     } catch {
       recognitionRef.current = null;
       setRecording(false);
-      if (analyze) finishAnalysis(finalTranscriptRef.current || latestTranscriptRef.current);
+      if (analyze) {
+        shouldAnalyzeRef.current = false;
+        finishAnalysis(finalTranscriptRef.current || latestTranscriptRef.current);
+      }
     }
   }
 
