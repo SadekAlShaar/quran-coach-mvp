@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { surahs } from "@/lib/surahs";
 import { analyzeTranscript, type LocalAnalysis, type WordResult } from "@/lib/localAnalysis";
+import { deleteLastRecording, getLastRecording, saveLastRecording } from "@/lib/recordingStorage";
 
 type Analysis = LocalAnalysis;
 
@@ -94,12 +95,35 @@ export default function Practice() {
   const [playingWordPosition, setPlayingWordPosition] = useState<number | null>(null);
   const [playingAllMistakes, setPlayingAllMistakes] = useState(false);
   const [playingAyah, setPlayingAyah] = useState(false);
+  const [hasSavedRecording, setHasSavedRecording] = useState(false);
+  const [savedRecordingAt, setSavedRecordingAt] = useState<string | null>(null);
+  const [playingSavedRecording, setPlayingSavedRecording] = useState(false);
+  const savedRecordingAudioRef = useRef<HTMLAudioElement | null>(null);
+  const savedRecordingUrlRef = useRef<string | null>(null);
 
   const surah = useMemo(() => surahs.find((s) => s.number === surahNo) ?? surahs[0], [surahNo]);
   const ayah = useMemo(() => surah.ayahs.find((a) => a.number === ayahNo) ?? surah.ayahs[0], [surah, ayahNo]);
 
   useEffect(() => {
     currentSelectionRef.current = { profile, surahNo, ayahNo };
+  }, [profile, surahNo, ayahNo]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getLastRecording(profile, surahNo, ayahNo)
+      .then((saved) => {
+        if (cancelled) return;
+        setHasSavedRecording(Boolean(saved));
+        setSavedRecordingAt(saved?.createdAt ?? null);
+      })
+      .catch((error) => {
+        console.error("Could not check saved recording", error);
+        if (!cancelled) {
+          setHasSavedRecording(false);
+          setSavedRecordingAt(null);
+        }
+      });
+    return () => { cancelled = true; };
   }, [profile, surahNo, ayahNo]);
 
   const wordsWithPositions = useMemo<PositionedWord[]>(() => {
@@ -188,6 +212,7 @@ export default function Practice() {
       worker.terminate();
       workerRef.current = null;
       cleanupRecorder(true);
+      stopSavedRecording();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -201,6 +226,7 @@ export default function Practice() {
     cleanupRecorder(true);
     stopWordAudio();
     stopAyahAudio();
+    stopSavedRecording();
     setSurahNo(nextSurahNo);
     setAyahNo(1);
     attemptContextRef.current = null;
@@ -225,6 +251,66 @@ export default function Practice() {
     const chapter = String(surah.number).padStart(3, "0");
     const verse = String(ayah.number).padStart(3, "0");
     return `https://verses.quran.com/Alafasy/mp3/${chapter}${verse}.mp3`;
+  }
+
+  function stopSavedRecording() {
+    if (savedRecordingAudioRef.current) {
+      savedRecordingAudioRef.current.pause();
+      savedRecordingAudioRef.current.currentTime = 0;
+      savedRecordingAudioRef.current = null;
+    }
+    if (savedRecordingUrlRef.current) {
+      URL.revokeObjectURL(savedRecordingUrlRef.current);
+      savedRecordingUrlRef.current = null;
+    }
+    setPlayingSavedRecording(false);
+  }
+
+  async function playSavedRecording() {
+    if (recording || busy) return;
+    stopWordAudio();
+    stopAyahAudio();
+    stopSavedRecording();
+
+    try {
+      const saved = await getLastRecording(profile, surah.number, ayah.number);
+      if (!saved) {
+        setHasSavedRecording(false);
+        setSavedRecordingAt(null);
+        setStatus("ما في تسجيل محفوظ لهالآية بعد.");
+        return;
+      }
+
+      const url = URL.createObjectURL(saved.blob);
+      savedRecordingUrlRef.current = url;
+      const player = new Audio(url);
+      savedRecordingAudioRef.current = player;
+      setPlayingSavedRecording(true);
+
+      await new Promise<void>((resolve, reject) => {
+        player.onended = () => resolve();
+        player.onerror = () => reject(new Error("Could not play saved recording."));
+        player.play().catch(reject);
+      });
+    } catch (error) {
+      console.error("Could not play saved recording", error);
+      setStatus("ما قدرت شغّل التسجيل المحفوظ. جرّب مرة ثانية.");
+    } finally {
+      stopSavedRecording();
+    }
+  }
+
+  async function removeSavedRecording() {
+    stopSavedRecording();
+    try {
+      await deleteLastRecording(profile, surah.number, ayah.number);
+      setHasSavedRecording(false);
+      setSavedRecordingAt(null);
+      setStatus("تم حذف آخر تسجيل لهالآية من هذا الجهاز.");
+    } catch (error) {
+      console.error("Could not delete saved recording", error);
+      setStatus("ما قدرت احذف التسجيل المحفوظ.");
+    }
   }
 
   function stopAyahAudio() {
@@ -405,6 +491,7 @@ export default function Practice() {
 
     stopWordAudio();
     stopAyahAudio();
+    stopSavedRecording();
     setAnalysis(null);
     discardRecordingRef.current = false;
     chunksRef.current = [];
@@ -451,6 +538,24 @@ export default function Practice() {
 
         const type = recorder.mimeType || mimeType || "audio/webm";
         const blob = new Blob(chunks, { type });
+        const attempt = attemptContextRef.current;
+
+        if (attempt) {
+          void saveLastRecording(attempt.profile, attempt.surahNo, attempt.ayahNo, blob)
+            .then((createdAt) => {
+              const current = currentSelectionRef.current;
+              if (
+                current.profile === attempt.profile &&
+                current.surahNo === attempt.surahNo &&
+                current.ayahNo === attempt.ayahNo
+              ) {
+                setHasSavedRecording(true);
+                setSavedRecordingAt(createdAt);
+              }
+            })
+            .catch((error) => console.error("Could not save last recording", error));
+        }
+
         void sendRecordingForAnalysis(blob);
       };
 
@@ -491,7 +596,7 @@ export default function Practice() {
     <main>
       <section className="hero">
         <h1>مدرّب التلاوة 🌙</h1>
-        <p>سجّل الآية، والموديل القرآني FastConformer يحللها محليًا على جهازك. ما في Gemini أو OpenAI API، والتسجيل نفسه ما بينحفظ.</p>
+        <p>سجّل الآية، والموديل القرآني FastConformer يحللها محليًا على جهازك. ما في Gemini أو OpenAI API. نحفظ فقط آخر تسجيل لكل آية ولكل شخص على نفس الجهاز.</p>
         {installPrompt && (
           <div className="controls">
             <button className="secondary" onClick={installApp}>📲 ثبّت التطبيق على الموبايل</button>
@@ -522,6 +627,7 @@ export default function Practice() {
               cleanupRecorder(true);
               stopWordAudio();
               stopAyahAudio();
+              stopSavedRecording();
               setAyahNo(Number(e.target.value));
               attemptContextRef.current = null;
               setAnalysis(null);
@@ -557,6 +663,30 @@ export default function Practice() {
             <button className="danger" onClick={stopRecording}>⏹️ انتهيت</button>
           )}
         </div>
+
+        {hasSavedRecording && (
+          <div className="controls">
+            <button
+              type="button"
+              className="secondary"
+              onClick={playSavedRecording}
+              disabled={recording || busy || playingSavedRecording}
+            >
+              {playingSavedRecording ? "▶️ عم شغّل تسجيلك…" : "▶️ اسمع آخر تسجيل"}
+            </button>
+            <button
+              type="button"
+              className="danger"
+              onClick={removeSavedRecording}
+              disabled={recording || busy || playingSavedRecording}
+            >
+              🗑️ احذف التسجيل
+            </button>
+            {savedRecordingAt && (
+              <div className="small">آخر تسجيل محفوظ على هذا الجهاز: {new Date(savedRecordingAt).toLocaleString("ar")}</div>
+            )}
+          </div>
+        )}
 
         {!recorderSupported && (
           <div className="status error">المتصفح الحالي ما بيدعم MediaRecorder. افتح التطبيق على Safari أو Chrome حديث.</div>
@@ -626,7 +756,7 @@ export default function Practice() {
       </section>
 
       <div className="notice">
-        ✅ مجاني بالكامل: التسجيل مؤقت ولا يُحفظ. موديل القرآن وملفاته فقط تُخزّن في كاش المتصفح بعد أول تحميل. ⚠️ هذا الإصدار يصحح الكلمات باستخدام موديل مخصص لتلاوة القرآن؛ تقييم المخارج والمد والغنة بدقة سيكون مرحلة منفصلة.
+        ✅ مجاني بالكامل: التحليل يتم على الجهاز. نحفظ فقط آخر تسجيل لكل آية ولكل شخص داخل تخزين المتصفح على هذا الجهاز، والتسجيل الجديد يستبدل القديم. حذف بيانات الموقع أو حذف الـPWA قد يحذف التسجيلات. ⚠️ تقييم المخارج والمد والغنة بدقة سيكون مرحلة منفصلة.
       </div>
     </main>
   );
