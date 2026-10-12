@@ -12,6 +12,29 @@ type PositionedWord = WordResult & {
   quranPosition: number | null;
 };
 
+type AttemptContext =
+  | {
+      mode: "ayah";
+      profile: string;
+      surahNo: number;
+      ayahNo: number;
+      expectedText: string;
+    }
+  | {
+      mode: "word";
+      profile: string;
+      surahNo: number;
+      ayahNo: number;
+      expectedText: string;
+      resultIndex: number;
+      quranPosition: number | null;
+    };
+
+type WordRetryFeedback = {
+  correct: boolean;
+  heard: string;
+};
+
 const PROFILES = ["أبي", "أمي", "أنا"];
 
 function preferredAudioMimeType(): string | undefined {
@@ -63,6 +86,7 @@ export default function Practice() {
   const [surahNo, setSurahNo] = useState(1);
   const [ayahNo, setAyahNo] = useState(1);
   const [recording, setRecording] = useState(false);
+  const [recordingMode, setRecordingMode] = useState<"ayah" | "word" | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("اضغط على الميكروفون واقرأ الآية كاملة.");
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
@@ -71,6 +95,12 @@ export default function Practice() {
   const [modelReady, setModelReady] = useState(false);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelProgress, setModelProgress] = useState<number | null>(null);
+  const [wordRetryTarget, setWordRetryTarget] = useState<{
+    resultIndex: number;
+    expected: string;
+    quranPosition: number | null;
+  } | null>(null);
+  const [wordRetryFeedback, setWordRetryFeedback] = useState<Record<number, WordRetryFeedback>>({});
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -78,14 +108,9 @@ export default function Practice() {
   const discardRecordingRef = useRef(false);
   const workerRef = useRef<Worker | null>(null);
   const pendingAudioRef = useRef<Float32Array | null>(null);
-  const attemptContextRef = useRef<{
-    profile: string;
-    surahNo: number;
-    ayahNo: number;
-    expectedText: string;
-  } | null>(null);
+  const attemptContextRef = useRef<AttemptContext | null>(null);
 
-  // The Whisper worker listener is created once. Keep the latest UI selection in
+  // The Quran ASR worker listener is created once. Keep the latest UI selection in
   // a ref so async results are compared with the current ayah/profile instead of
   // the values captured by the first React render.
   const currentSelectionRef = useRef({ profile, surahNo, ayahNo });
@@ -180,7 +205,12 @@ export default function Practice() {
 
       if (message.type === "transcribing") {
         setBusy(true);
-        setStatus("عم حلّل التلاوة بالמודيل القرآني على جهازك…");
+        const attempt = attemptContextRef.current;
+        setStatus(
+          attempt?.mode === "word"
+            ? `عم حلّل كلمة «${attempt.expectedText}» على جهازك…`
+            : "عم حلّل التلاوة بالموديل القرآني على جهازك…"
+        );
         return;
       }
 
@@ -194,6 +224,8 @@ export default function Practice() {
       if (message.type === "error") {
         console.error("Local Quran ASR error", message.message);
         pendingAudioRef.current = null;
+        attemptContextRef.current = null;
+        setWordRetryTarget(null);
         setBusy(false);
         setModelLoading(false);
         setStatus("صار خطأ أثناء التحليل القرآني المحلي. إذا كانت أول مرة، تأكد أن الإنترنت شغال حتى ينزل الموديل، وبعدها جرّب مرة ثانية.");
@@ -231,6 +263,8 @@ export default function Practice() {
     setAyahNo(1);
     attemptContextRef.current = null;
     setAnalysis(null);
+    setWordRetryTarget(null);
+    setWordRetryFeedback({});
     setStatus("اضغط على الميكروفون واقرأ الآية كاملة.");
   }
 
@@ -250,7 +284,7 @@ export default function Practice() {
   function quranAyahAudioUrl() {
     const chapter = String(surah.number).padStart(3, "0");
     const verse = String(ayah.number).padStart(3, "0");
-    return `https://verses.quran.com/Alafasy/mp3/${chapter}${verse}.mp3`;
+    return `https://verse.mp3quran.net/data/Ibrahim_Akhdar_32kbps/${chapter}${verse}.mp3`;
   }
 
   function stopSavedRecording() {
@@ -405,14 +439,11 @@ export default function Practice() {
     attemptContextRef.current = null;
 
     if (!attempt) {
-      // The user changed surah/ayah or cancelled while Whisper was working.
       setBusy(false);
+      setWordRetryTarget(null);
       return;
     }
 
-    // Never show an old result under a newly selected ayah. Use the latest
-    // selection ref here because this callback is invoked asynchronously by a
-    // worker whose listener was registered on the first render.
     const current = currentSelectionRef.current;
     if (
       attempt.surahNo !== current.surahNo ||
@@ -420,19 +451,66 @@ export default function Practice() {
       attempt.profile !== current.profile
     ) {
       setBusy(false);
+      setWordRetryTarget(null);
       setStatus("تم تجاهل نتيجة قديمة لأنك غيّرت السورة أو الآية.");
       return;
     }
 
     if (!cleanTranscript) {
-      setAnalysis(null);
-      setStatus("الموديل القرآني ما التقط كلمات واضحة. قرّب الموبايل، ارفع صوتك شوي، وجرب مرة ثانية.");
+      if (attempt.mode === "ayah") setAnalysis(null);
+      setStatus(
+        attempt.mode === "word"
+          ? `الموديل ما التقط كلمة «${attempt.expectedText}» بوضوح. قرّب الموبايل وجرّب مرة ثانية.`
+          : "الموديل القرآني ما التقط كلمات واضحة. قرّب الموبايل، ارفع صوتك شوي، وجرب مرة ثانية."
+      );
       setBusy(false);
+      setWordRetryTarget(null);
+      return;
+    }
+
+    if (attempt.mode === "word") {
+      const retryResult = analyzeTranscript(attempt.expectedText, cleanTranscript);
+      const correct = retryResult.score === 100 && retryResult.words.every((word) => word.status === "correct");
+
+      setWordRetryFeedback((previous) => ({
+        ...previous,
+        [attempt.resultIndex]: { correct, heard: cleanTranscript },
+      }));
+
+      if (correct) {
+        setAnalysis((previous) => {
+          if (!previous) return previous;
+          const words = previous.words.map((word, index) =>
+            index === attempt.resultIndex
+              ? { ...word, status: "correct" as const, heard: cleanTranscript }
+              : word
+          );
+          const correctCount = words.filter((word) => word.status === "correct").length;
+          const score = Math.round((correctCount / Math.max(words.length, 1)) * 100);
+          const mistakes = words.filter((word) => word.status !== "correct").length;
+          return {
+            ...previous,
+            words,
+            score,
+            feedback:
+              mistakes === 0
+                ? "ممتاز! صححت كل الكلمات التي كانت تحتاج إعادة ✅"
+                : `ممتاز، صححت الكلمة ✅ بقي ${mistakes} موضع يحتاج إعادة.`,
+          };
+        });
+        setStatus(`✅ ممتاز! كلمة «${attempt.expectedText}» صارت صحيحة.`);
+      } else {
+        setStatus(`لسا كلمة «${attempt.expectedText}» بدها إعادة. الموديل التقط: «${cleanTranscript}». اسمعها وحاول مرة ثانية.`);
+      }
+
+      setBusy(false);
+      setWordRetryTarget(null);
       return;
     }
 
     const result = analyzeTranscript(attempt.expectedText, cleanTranscript);
     setAnalysis(result);
+    setWordRetryFeedback({});
     setStatus(result.feedback);
     localStorage.setItem(
       `progress-${attempt.profile}-${attempt.surahNo}-${attempt.ayahNo}`,
@@ -458,8 +536,13 @@ export default function Practice() {
     }
 
     releaseStream();
-    if (discard) chunksRef.current = [];
+    if (discard) {
+      chunksRef.current = [];
+      attemptContextRef.current = null;
+      setWordRetryTarget(null);
+    }
     setRecording(false);
+    setRecordingMode(null);
   }
 
   async function sendRecordingForAnalysis(blob: Blob) {
@@ -481,7 +564,7 @@ export default function Practice() {
     }
   }
 
-  async function startRecording() {
+  async function beginRecording(attempt: AttemptContext, clearCurrentAnalysis: boolean) {
     if (recording || busy) return;
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
       setRecorderSupported(false);
@@ -492,18 +575,30 @@ export default function Practice() {
     stopWordAudio();
     stopAyahAudio();
     stopSavedRecording();
-    setAnalysis(null);
+    if (clearCurrentAnalysis) {
+      setAnalysis(null);
+      setWordRetryFeedback({});
+    }
     discardRecordingRef.current = false;
     chunksRef.current = [];
-    attemptContextRef.current = {
-      profile,
-      surahNo: surah.number,
-      ayahNo: ayah.number,
-      expectedText: ayah.simpleText,
-    };
+    attemptContextRef.current = attempt;
+    setRecordingMode(attempt.mode);
+    setWordRetryTarget(
+      attempt.mode === "word"
+        ? {
+            resultIndex: attempt.resultIndex,
+            expected: attempt.expectedText,
+            quranPosition: attempt.quranPosition,
+          }
+        : null
+    );
 
     try {
-      setStatus("عم افتح الميكروفون…");
+      setStatus(
+        attempt.mode === "word"
+          ? `عم افتح الميكروفون لإعادة كلمة «${attempt.expectedText}»…`
+          : "عم افتح الميكروفون…"
+      );
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -533,21 +628,29 @@ export default function Practice() {
         chunksRef.current = [];
         releaseStream();
         setRecording(false);
+        setRecordingMode(null);
 
         if (discard || chunks.length === 0) return;
 
         const type = recorder.mimeType || mimeType || "audio/webm";
         const blob = new Blob(chunks, { type });
-        const attempt = attemptContextRef.current;
+        const currentAttempt = attemptContextRef.current;
 
-        if (attempt) {
-          void saveLastRecording(attempt.profile, attempt.surahNo, attempt.ayahNo, blob)
+        // Only a full-ayah attempt becomes the saved "last recording".
+        // Word retries are temporary and disappear after analysis.
+        if (currentAttempt?.mode === "ayah") {
+          void saveLastRecording(
+            currentAttempt.profile,
+            currentAttempt.surahNo,
+            currentAttempt.ayahNo,
+            blob
+          )
             .then((createdAt) => {
               const current = currentSelectionRef.current;
               if (
-                current.profile === attempt.profile &&
-                current.surahNo === attempt.surahNo &&
-                current.ayahNo === attempt.ayahNo
+                current.profile === currentAttempt.profile &&
+                current.surahNo === currentAttempt.surahNo &&
+                current.ayahNo === currentAttempt.ayahNo
               ) {
                 setHasSavedRecording(true);
                 setSavedRecordingAt(createdAt);
@@ -559,18 +662,22 @@ export default function Practice() {
         void sendRecordingForAnalysis(blob);
       };
 
-      // Warm up/download the Quran-specific FastConformer while the user is reading.
-      // The model/assets are cached in browser Cache Storage for later attempts.
       if (!modelReady && !modelLoading) workerRef.current?.postMessage({ type: "load" });
 
       recorder.start(250);
       setRecording(true);
-      setStatus("عم سجّل… اقرأ الآية، ولما تخلص اضغط «انتهيت» 🎙️");
+      setStatus(
+        attempt.mode === "word"
+          ? `🎙️ قل كلمة «${attempt.expectedText}» فقط، ثم اضغط «انتهيت».`
+          : "عم سجّل… اقرأ الآية، ولما تخلص اضغط «انتهيت» 🎙️"
+      );
     } catch (error: any) {
       console.error("Could not access microphone", error);
       releaseStream();
       attemptContextRef.current = null;
+      setWordRetryTarget(null);
       setRecording(false);
+      setRecordingMode(null);
       if (error?.name === "NotAllowedError" || error?.name === "SecurityError") {
         setStatus("المتصفح ما أعطى إذن للميكروفون. افتح إعدادات الموقع واسمح بالميكروفون ثم جرّب مرة ثانية.");
       } else {
@@ -579,10 +686,44 @@ export default function Practice() {
     }
   }
 
+  async function startRecording() {
+    await beginRecording(
+      {
+        mode: "ayah",
+        profile,
+        surahNo: surah.number,
+        ayahNo: ayah.number,
+        expectedText: ayah.simpleText,
+      },
+      true
+    );
+  }
+
+  async function startWordRetry(word: PositionedWord) {
+    if (word.status !== "wrong" && word.status !== "missing") return;
+    await beginRecording(
+      {
+        mode: "word",
+        profile,
+        surahNo: surah.number,
+        ayahNo: ayah.number,
+        expectedText: word.expected,
+        resultIndex: word.resultIndex,
+        quranPosition: word.quranPosition,
+      },
+      false
+    );
+  }
+
   function stopRecording() {
     if (!recording) return;
     discardRecordingRef.current = false;
-    setStatus("تم التسجيل. عم جهّز القراءة للتحليل…");
+    const attempt = attemptContextRef.current;
+    setStatus(
+      attempt?.mode === "word"
+        ? "تم تسجيل الكلمة. عم جهّزها للتحليل…"
+        : "تم التسجيل. عم جهّز القراءة للتحليل…"
+    );
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== "inactive") {
       try { recorder.stop(); } catch {
@@ -596,7 +737,7 @@ export default function Practice() {
     <main>
       <section className="hero">
         <h1>مدرّب التلاوة 🌙</h1>
-        <p>سجّل الآية، والموديل القرآني FastConformer يحللها محليًا على جهازك. ما في Gemini أو OpenAI API. نحفظ فقط آخر تسجيل لكل آية ولكل شخص على نفس الجهاز.</p>
+        <p>سجّل الآية، والموديل القرآني FastConformer يحللها محليًا على جهازك. إذا ظهرت كلمة غلط، اسمعها وأعد نفس الكلمة فقط حتى تصير خضراء. ما في Gemini أو OpenAI API.</p>
         {installPrompt && (
           <div className="controls">
             <button className="secondary" onClick={installApp}>📲 ثبّت التطبيق على الموبايل</button>
@@ -631,6 +772,8 @@ export default function Practice() {
               setAyahNo(Number(e.target.value));
               attemptContextRef.current = null;
               setAnalysis(null);
+              setWordRetryTarget(null);
+              setWordRetryFeedback({});
               setStatus("اضغط على الميكروفون واقرأ الآية كاملة.");
             }}
           >
@@ -652,15 +795,21 @@ export default function Practice() {
               setStatus("ما قدرت شغّل تلاوة الآية. جرّب مرة ثانية وتأكد من اتصال الإنترنت.");
             })}
           >
-            {playingAyah ? "🕌 عم يقرأ الآية…" : "🕌 اسمع الآية بتجويد"}
+            {playingAyah ? "🕌 الشيخ إبراهيم الأخضر يقرأ…" : "🕌 اسمع الآية — إبراهيم الأخضر"}
           </button>
         </div>
 
         <div className="controls">
-          {!recording ? (
-            <button className="primary" onClick={startRecording} disabled={busy || !recorderSupported}>🎙️ ابدأ القراءة</button>
-          ) : (
+          {recordingMode === "ayah" ? (
             <button className="danger" onClick={stopRecording}>⏹️ انتهيت</button>
+          ) : (
+            <button
+              className="primary"
+              onClick={startRecording}
+              disabled={busy || recording || !recorderSupported}
+            >
+              🎙️ ابدأ قراءة الآية
+            </button>
           )}
         </div>
 
@@ -720,7 +869,7 @@ export default function Practice() {
                           console.error(error);
                           setStatus("ما قدرت شغّل نطق الكلمة. جرّب مرة ثانية وتأكد من اتصال الإنترنت.");
                         })}
-                        disabled={playingAllMistakes || playingAyah}
+                        disabled={playingAllMistakes || playingAyah || recording || busy}
                         aria-label={`اسمع النطق الصحيح لكلمة ${w.expected}`}
                       >
                         {playingWordPosition === w.quranPosition ? "🔊 عم يقرأ…" : "🔊 اسمع الكلمة"}
@@ -732,12 +881,45 @@ export default function Practice() {
                           console.error(error);
                           setStatus("ما قدرت شغّل تلاوة الآية. جرّب مرة ثانية وتأكد من اتصال الإنترنت.");
                         })}
-                        disabled={playingAllMistakes || playingAyah}
+                        disabled={playingAllMistakes || playingAyah || recording || busy}
                         aria-label={`اسمع كلمة ${w.expected} ضمن تلاوة الآية`}
                       >
                         🕌 اسمعها ضمن الآية
                       </button>
+                      <button
+                        type="button"
+                        className={
+                          recordingMode === "word" && wordRetryTarget?.resultIndex === w.resultIndex
+                            ? "danger"
+                            : "wordListen"
+                        }
+                        onClick={() => {
+                          if (recordingMode === "word" && wordRetryTarget?.resultIndex === w.resultIndex) {
+                            stopRecording();
+                          } else {
+                            void startWordRetry(w);
+                          }
+                        }}
+                        disabled={
+                          busy ||
+                          playingAllMistakes ||
+                          playingAyah ||
+                          (recording && wordRetryTarget?.resultIndex !== w.resultIndex)
+                        }
+                        aria-label={`أعد قراءة كلمة ${w.expected}`}
+                      >
+                        {recordingMode === "word" && wordRetryTarget?.resultIndex === w.resultIndex
+                          ? "⏹️ انتهيت"
+                          : "🎙️ أعد الكلمة"}
+                      </button>
                     </>
+                  )}
+                  {wordRetryFeedback[w.resultIndex] && (
+                    <div className="small">
+                      {wordRetryFeedback[w.resultIndex].correct
+                        ? `✅ ممتاز — «${w.expected}» صارت صحيحة.`
+                        : `❌ الموديل التقط: «${wordRetryFeedback[w.resultIndex].heard}» — حاول مرة ثانية.`}
+                    </div>
                   )}
                 </div>
               ))}
@@ -745,7 +927,7 @@ export default function Practice() {
 
             {wordsWithPositions.some((w) => w.status === "wrong" || w.status === "missing") && (
               <div className="controls">
-                <button type="button" className="secondary" onClick={hearAllMistakes} disabled={playingAllMistakes}>
+                <button type="button" className="secondary" onClick={hearAllMistakes} disabled={playingAllMistakes || recording || busy}>
                   {playingAllMistakes ? "🔊 عم يقرأ الكلمات…" : "🔊 اسمع كل الكلمات التي تحتاج إعادة"}
                 </button>
               </div>
@@ -756,7 +938,7 @@ export default function Practice() {
       </section>
 
       <div className="notice">
-        ✅ مجاني بالكامل: التحليل يتم على الجهاز. نحفظ فقط آخر تسجيل لكل آية ولكل شخص داخل تخزين المتصفح على هذا الجهاز، والتسجيل الجديد يستبدل القديم. حذف بيانات الموقع أو حذف الـPWA قد يحذف التسجيلات. ⚠️ تقييم المخارج والمد والغنة بدقة سيكون مرحلة منفصلة.
+        ✅ مجاني بالكامل: التحليل يتم على الجهاز. إعادة الكلمات الغلط تُحلَّل مؤقتًا ولا تُحفظ؛ نحفظ فقط آخر تسجيل كامل لكل آية ولكل شخص على هذا الجهاز. ⚠️ تقييم المخارج والمد والغنة بدقة سيكون مرحلة منفصلة.
       </div>
     </main>
   );
