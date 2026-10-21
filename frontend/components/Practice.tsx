@@ -284,7 +284,7 @@ export default function Practice() {
   function quranAyahAudioUrl() {
     const chapter = String(surah.number).padStart(3, "0");
     const verse = String(ayah.number).padStart(3, "0");
-    return `https://verse.mp3quran.net/data/Ibrahim_Akhdar_32kbps/${chapter}${verse}.mp3`;
+    return `https://everyayah.com/data/Ayman_Sowaid_64kbps/${chapter}${verse}.mp3`;
   }
 
   function stopSavedRecording() {
@@ -795,7 +795,7 @@ export default function Practice() {
               setStatus("ما قدرت شغّل تلاوة الآية. جرّب مرة ثانية وتأكد من اتصال الإنترنت.");
             })}
           >
-            {playingAyah ? "🕌 الشيخ إبراهيم الأخضر يقرأ…" : "🕌 اسمع الآية — إبراهيم الأخضر"}
+            {playingAyah ? "🕌 الشيخ أيمن سويد يقرأ…" : "🕌 اسمع الآية — أيمن سويد"}
           </button>
         </div>
 
